@@ -50,20 +50,29 @@ For a `jki` loop at u-points (center `j`, face `I` — the shape of
 `MOM_isopycnal_slopes.F90`'s zonal loop):
 
 ```fortran
-do jsb=js,je,njblock
+do jsb=js,je,njblock ; do IsbB=is,ie,niblock
   jeb = min(je, jsb+njblock-1) ; jje = jeb-jsb+1
-  do IsbB=is,ie,niblock
-    IebB = min(ie, IsbB+niblock-1) ; IIe = IebB-IsbB+1
-    do K=nz,2,-1              ! stays sequential — this is the recurrence
-      ! fill phase: do jj=1,jje ; do II=1,IIe ; I=IsbB+II-1 ; j=jsb+jj-1
-      !   fill the batched-EOS input arrays (T/S/pres) for the whole tile
-      ! one batched calculate_density_derivs(_2d) call over the whole tile
-      ! main phase: do jj=1,jje ; do II=1,IIe ; I=IsbB+II-1 ; j=jsb+jj-1
-      !   the original per-(j,K,i) body, reading the batched EOS outputs
-    enddo
+  IebB = min(ie, IsbB+niblock-1) ; IIe = IebB-IsbB+1
+  do K=nz,2,-1              ! stays sequential — this is the recurrence
+    ! fill phase: do jj=1,jje ; do II=1,IIe ; I=IsbB+II-1 ; j=jsb+jj-1
+    !   fill the batched-EOS input arrays (T/S/pres) for the whole tile
+    ! one batched calculate_density_derivs(_2d) call over the whole tile
+    ! main phase: do jj=1,jje ; do II=1,IIe ; I=IsbB+II-1 ; j=jsb+jj-1
+    !   the original per-(j,K,i) body, reading the batched EOS outputs
   enddo
-enddo
+enddo ; enddo
 ```
+
+**Style convention: chain the outer/inner block-loop headers onto one
+line.** The outer (`jsb`) and inner (`IsbB`) loop openers share a line, with
+the outer block's bound/count pair (`jeb`/`jje`) computed as the body's first
+statement and the inner block's pair (`IebB`/`IIe`) as its second — same
+`j`-then-`i` ordering as the loop nest itself — followed by a blank line and
+then the loop's actual work. Close both loops the same way, `enddo ; enddo`
+on one line. This matches the `do j=... ; do i=...` single-line nested-loop
+idiom already used for short loops elsewhere in this codebase, extended here
+to a loop nest whose body spans many lines. `set_BBL_TKE` (see "Worked
+examples" below) is the settled example of this formatting.
 
 At v-points (the meridional loop), the center/face pairing swaps: the outer
 block becomes face-indexed (`JsbB:JebB`, block-local `JJ`/`JJe`) and the
@@ -258,14 +267,40 @@ second `!$omp target` region wrapping `do k=nkml+1,nz`. `set_viscous_ML`'s
 `nz*3` down to 3. There's real code duplication in splitting a loop body this
 way — accept it; it's the point.
 
-**A sequential CPU-only early-exit (`if (.not.do_any) exit`) inside that same
-`k`-loop doesn't survive once `k` is inside a GPU-parallel region** — there's
-no "exit early" once iterations aren't running in order. `set_viscous_ML`
-kept the early exit for CPU builds and compiled it out for GPU ones with
-`#ifndef __NVCOMPILER_OPENMP_GPU` / `#endif` around just that check.
+**The same restructuring applies to a `domore`/`exit`-style recurrence, even
+without a fixed `k`-threshold to split on.** Wrap the *entire*
+`do k=nz,1,-1 ... exit` loop in one `!$omp target` region (see SKILL.md's
+"Choosing a loop construct", option 4), with `!$omp loop collapse(n)` doing
+the per-`k` masked work inside, instead of a `do concurrent` kernel launched
+fresh every `k`. Measured directly on `MOM_set_diffusivity.F90`'s
+`set_BBL_TKE` with a data-transfer-tracing log (see SKILL.md's "Verifying a
+port"): moving from one `do concurrent` per `k` to one `!$omp target` per
+whole recurrence cut the subroutine's total transfer/launch events from
+~8300 to ~1300, with the recurrence's own launch count dropping from
+one-per-`k`-per-tile down to one-per-call.
+
+**A sequential CPU-only early-exit (`if (.not.do_any) exit`) needs the
+`#ifndef __NVCOMPILER_OPENMP_GPU` guard only once the `k`-loop's body lives
+inside a persistent `!$omp target` region shared across every `k`, as in the
+restructuring just above** — not simply because offload directives exist
+nearby. A `do concurrent` kernel launched fresh each `k`, with the sequential
+`k`-loop itself remaining ordinary host Fortran in between launches, can
+check `if (.not.do_any) exit` exactly as on CPU: the exit runs as genuine
+host code between kernel launches, so it needs no guard for correctness
+there. Once the whole recurrence moves inside one target region, though, the
+early-exit interacts with the region's control flow differently, and
+`set_viscous_ML` compiles out the tracking flag and the `exit` for GPU
+builds with `#ifndef __NVCOMPILER_OPENMP_GPU` / `#endif`, always running the
+full `k` range instead — safe as long as the mask (`do_i`/`do_any`) still
+gates each column's work, making the extra iterations no-ops.
 Preprocessor-gating a CPU-only sequential optimization like this is the
 standard way to keep both paths correct when their control flow has to
-genuinely differ, not just their tile size.
+genuinely differ, not just their tile size. This guard is also worth adding
+purely for *performance*, even in the `do concurrent`-per-`k` form where
+it's not required for correctness: checking the flag every `k` means a
+host↔device round trip on that scalar every iteration, which can dominate a
+subroutine's transfer count (measured as ~94% of all transfer events for
+`set_BBL_TKE` before this guard was added).
 
 **A single intrinsic call (`exp`, and likely other transcendentals) is not
 guaranteed bitwise-identical between CPU and GPU** — see
@@ -299,3 +334,9 @@ local-domain extent (`G%iedB-G%isdB+1` / `G%jedB-G%jsdB+1`) when either
   block size described above. Use `git log`/`git show` on the individual
   commits in that range for concrete diffs of any of the techniques on this
   page.
+- `MOM_set_diffusivity.F90`'s `set_BBL_TKE` (in-tree on `dev/gpu`, not a
+  separate branch): blocking, `do concurrent` conversion, the `map(alloc:)`-
+  vs-`map(to:)` bug, and the later `!$omp target`/`!$omp loop` recurrence
+  restructuring described above, each landed as its own bit-for-bit-verified
+  commit. `git log --oneline -- src/parameterizations/vertical/MOM_set_diffusivity.F90`
+  finds the sequence.

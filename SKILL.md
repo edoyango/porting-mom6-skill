@@ -45,9 +45,12 @@ Before converting a loop:
 
 ## Choosing a loop construct
 
-Try these in order. Each fallback exists to solve a specific, concrete
+Try options 1-3 in order. Each fallback exists to solve a specific, concrete
 problem with the option above it, not out of general preference — don't
-skip to a fallback unless its trigger actually applies.
+skip to a fallback unless its trigger actually applies. Option 4 addresses a
+different axis entirely (kernel-launch overhead across a sequential loop,
+not which construct can execute a given parallel loop) and can apply
+regardless of which of 1-3 you're using for the parallel work inside it.
 
 ### 1. `do concurrent` (default choice)
 
@@ -84,6 +87,20 @@ in easy-to-miss ways:
   `HAVE_FC_DO_CONCURRENT_LOCAL` is defined, else to nothing, so the same
   source stays portable to compilers without locality-specifier support;
   writing the clause directly silently drops that fallback.
+- **`DO_LOCALITY` takes exactly one locality-clause argument** — never
+  combine `local(...)` and `reduce(...)` into a single call, e.g.
+  `DO_LOCALITY(local(a,b), reduce(.or.:c))`: the comma inside one macro
+  invocation breaks the C preprocessor's argument count, since
+  `#define DO_LOCALITY(X) X` only takes one parameter. When a loop needs
+  both, chain two separate `DO_LOCALITY(...)` calls with `&` continuation
+  instead:
+  ```fortran
+  do concurrent (j=js:je, i=is:ie, do_i(i,j)) &
+        DO_LOCALITY(local(tmp1,tmp2)) &
+        DO_LOCALITY(reduce(.or.:do_any))
+  ```
+  matching precedent in `MOM_set_viscosity.F90` and `MOM_coms.F90`, which
+  both chain separate calls rather than combining clauses in one.
 - Remove any pre-existing `!$OMP parallel do` directive when converting a
   loop to `do concurrent` — the two shouldn't coexist on the same loop.
 - `do concurrent` supports a mask condition, which is a natural fit for the
@@ -151,6 +168,51 @@ enddo ; enddo
 
 Reach for this only after `target teams loop` has actually been tried and
 shown to fail — it's a second-line fallback, not an alternative default.
+
+### 4. `!$omp target` + `!$omp loop collapse(n)` (collapsing a sequential recurrence into one kernel launch)
+
+Unlike options 2-3, this isn't a fallback from `do concurrent`'s capability
+— it addresses a different problem entirely. A genuine sequential
+recurrence (e.g. the `do k=nz,1,-1` loops covered in
+`references/loop-blocking-guide.md`, with a real top-down/bottom-up
+dependency) would otherwise launch one `do concurrent` kernel *per
+iteration* of that outer sequential loop. Each individual kernel can be
+fast, but if the outer loop runs many times (once per vertical level, for
+example), the per-iteration launch/sync overhead adds up. This can only be used
+if there are no routine calls within the loop.
+
+Wrap the *whole* sequential loop in one `!$omp target` region, and use
+`!$omp loop collapse(n)` for the per-iteration parallel work inside it,
+instead of a fresh `do concurrent` kernel each iteration:
+
+```fortran
+!$omp target
+do k=nz,1,-1
+  !$omp loop collapse(2) private(ii,jj)
+  do j=js,je ; do i=is,ie
+    ii = i-is+1 ; jj = j-js+1
+    if (mask(ii,jj)) then
+      ! per-(k,j,i) work
+    endif
+  enddo ; enddo
+enddo
+!$omp end target
+```
+
+This is the pattern `MOM_continuity_PPM.F90`'s `zonal_flux_adjust`/
+`meridional_flux_adjust` use for their Newton-iteration recurrence. A few
+differences from `do concurrent` worth knowing:
+
+- **No inline mask condition.** `!$omp loop` doesn't support `do
+  concurrent`'s trailing `, mask(i,j) > 0` condition — use an ordinary
+  `if (...) then ... endif` wrapping the loop body instead.
+- **No `DO_LOCALITY` macro.** `!$omp loop`'s `private(...)` clause is plain
+  OpenMP syntax, not `do concurrent`'s locality-specifier mechanism, so it
+  doesn't need the compatibility macro at all.
+
+If the recurrence has a `domore`/`exit`-style early-out, see "Reduce
+kernel-launch count" in `references/loop-blocking-guide.md` for how that
+interacts with this pattern.
 
 ## Data mapping: what's already resident, and what you must map yourself
 
@@ -256,6 +318,22 @@ Before considering a port done:
   broader performance regressions. It may not be populated yet — check
   whether it exists and has usable scripts before assuming it's available,
   and ask the user if you can't find it.
+- **Data-transfer volume**: `nvfortran`'s `NV_ACC_NOTIFY` environment
+  variable (set to `3`, or `2` for a lighter version) logs every host↔device
+  upload, download, and kernel launch to stderr, tagged with source file,
+  line, function name (lowercased), and — for transfers — variable name and
+  byte count. Capture a run with it enabled, then filter the log for the
+  subroutine you ported (its lowercased name) to isolate its activity from
+  the rest of the run. Two things worth checking for: (1) a small scalar or
+  array transferred far more often than expected (e.g. once per loop
+  iteration rather than once per call) usually means a host-visible control
+  variable is round-tripping unnecessarily — see the `domore`/`exit`
+  discussion in `references/loop-blocking-guide.md`'s kernel-launch-count
+  section; (2) a Rule-4 argument deliberately left unmapped showing up with
+  *many* transfers, rather than none, means it isn't actually already
+  resident the way you assumed, and needs real mapping after all. The log
+  can be large (100MB+ for a full run) — don't read it directly, only
+  filter/count against it.
 
 ## Reference files
 

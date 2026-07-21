@@ -29,6 +29,26 @@ A scalar used only as a `local` inside a `do concurrent` loop does **not** need
 to appear in this subroutine-level `map(alloc:)` directive — the `local(...)`
 clause on the loop itself is sufficient and preferred.
 
+**Caveat: `map(alloc:)` assumes the device copy starts blank.** That's only
+correct for a local that's entirely filled and consumed *on the device* (or
+has no meaningful host value at that point). If a local is instead computed
+by an ordinary host call *before* the mapped region — e.g. a subroutine like
+`thickness_to_dz` filling a `dz` array that a later `do concurrent`/`!$omp
+target` block only reads — mapping it with `map(alloc:)` is wrong: nvfortran
+zero-initializes an `alloc`'d array (the same behavior the cheap-zero-init
+optimization in Rule 2 below relies on), so the device kernel silently reads
+zeros instead of the real host-computed values. Give that local its own
+`map(to:)` directive instead, separate from the `map(alloc:)` list for the
+genuinely device-computed locals:
+```fortran
+!$omp target enter data map(alloc: local_array_a, local_array_b)
+!$omp target enter data map(to: dz)
+```
+Before batching several locals into one `map(alloc:)` line, check each one
+individually: written-then-read entirely inside the device region (`alloc`
+is correct) vs. computed earlier on the host and only read on device (needs
+`to`) — don't batch by reflex.
+
 ## Rule 2 — CS variables that are static at runtime
 
 Fields inside a `*_CS` control structure that are set once during
