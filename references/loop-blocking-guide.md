@@ -83,10 +83,11 @@ loop's point type.
 ## Step-by-step (bisectable commits)
 
 Follow the commit discipline in `references/loop-blocking-shared-patterns.md`
-— small, individually-verified commits, commit only on a `mom6test` PASS.
-Every commit below is provably bit-identical by construction — block size
-never changes per-point arithmetic or ordering, only how work is chunked —
-until offload directives are introduced later.
+— small, individually-verified commits, commit only once a build+run
+reproduces the baseline `ocean.stats` bit-for-bit. Every commit below is
+provably bit-identical by construction — block size never changes per-point
+arithmetic or ordering, only how work is chunked — until offload directives
+are introduced later.
 
 1. **j-blocking skeleton.** Introduce `jstart`/`jend`/`jmax`/`jj` with
    `njblock` fixed at `1`. Convert `do j=js,je` into the `jstart` loop plus
@@ -289,8 +290,8 @@ local-domain extent (`G%iedB-G%isdB+1` / `G%jedB-G%jsdB+1`) when either
 - `MOM_isopycnal_slopes.F90`'s `calc_isoneutral_slopes` (zonal then
   meridional slope loops): blocked in 10 commits (skeleton → promote+split →
   batch EOS, ×2, one per loop, then skeleton → shrink for the i-dimension,
-  ×2, one per loop), each `mom6test`-verified before committing. Stopped
-  short of adding offload directives.
+  ×2, one per loop), each verified with a bit-for-bit `ocean.stats` match
+  before committing. Stopped short of adding offload directives.
 - `MOM_set_viscosity.F90`'s `set_viscous_ML` (branch
   `port-set_viscous_ML-tile`, commits `42094b2a8..17b3cc671`): the same
   `jki` blocking pattern carried all the way through offload directives,
