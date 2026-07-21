@@ -14,14 +14,13 @@ strictly sequential; only `j`/`i` can be blocked or parallelized.
 
 **kji** (this doc): `do k; do j; do i`, and each layer's calculation is
 *independent of every other layer* — nothing carries over from `k` to `k+1`.
-Because there's no recurrence, `k` itself is a legitimate axis to block *and*
-collapse into the parallel index set alongside `j`/`i`, not just something to
-loop over sequentially outside a `j`/`i` `do concurrent`. This matters
-because a naive per-layer port (`do k=1,nz` sequential on the host, with only
-the inner `j`/`i` loop as `do concurrent`) launches one (or several) small
-kernels per layer — `nz` times whatever the loop body needs. Grouping
-`nkblock` layers together and collapsing `k` into the same `do concurrent`
-as `j`/`i` turns that into far fewer, larger kernel launches.
+Because there's no recurrence, `k` itself is a legitimate axis to block
+*and* collapse into the parallel index set alongside `j`/`i`, rather than
+looping over it sequentially outside a `j`/`i` `do concurrent`. This
+matters because a naive per-layer port (`do k=1,nz` sequential on the host,
+only the inner `j`/`i` loop as `do concurrent`) launches `nz` times whatever
+the loop body needs; grouping `nkblock` layers and collapsing `k` into the
+same `do concurrent` as `j`/`i` turns that into far fewer, larger launches.
 
 Validated on `MOM_hor_visc.F90`'s `horizontal_viscosity` (branch
 `kblock-horvisc-fromgfdl`), which computes the horizontal viscosity
@@ -59,12 +58,11 @@ do k_start=1,nz,nkblock
 enddo
 ```
 
-The `do concurrent` header carries the **real, absolute `k`**, and the
-block-relative `kk` is derived inside the loop body only where it's needed —
-to index a scratch array sized `(...,nkblock)` rather than `(...,nz)`. This
-reads more naturally than the reverse (`kk` in the header, `k =
-k_start+kk-1` derived inside) whenever most of the loop body's arrays are
-already indexed by the real `k` anyway, which is the common case here.
+The `do concurrent` header carries the **real, absolute `k`**; the
+block-relative `kk` is derived inside the loop body only where needed, to
+index a scratch array sized `(...,nkblock)` rather than `(...,nz)` — see the
+worked `PPM_reconstruction_x` example below for why this reads more
+naturally than the reverse.
 
 Contrast with the `jki` shape: there, `k` remains a literal sequential `do`
 wrapping `j`/`i` tiles. Here, `k` sits *inside* the same `do concurrent` as
@@ -77,10 +75,9 @@ as shorthand for `k_start`/`k_end` above.
 ## Step-by-step (bisectable commits)
 
 Follow the commit discipline in `references/loop-blocking-shared-patterns.md`.
-Don't take a real branch's commit boundaries
-as license to go coarser than this — a prior k-blocking branch used a
-coarser split, and that's not something to emulate for granularity, only for
-the technical lessons below.
+Don't take a real branch's commit boundaries as license to go coarser than
+this — a prior k-blocking branch used a coarser split, and that's not
+something to emulate for granularity, only for the technical lessons below.
 
 1. **Add the `nkblock` trailing dimension to every local scratch array that
    needs to carry a value across the loop body**, at compile-time
@@ -133,8 +130,9 @@ have zeroed the whole block.
 
 **`do concurrent` can't contain a call to a non-`pure` procedure, and can't
 safely collapse a dimension carrying a genuine cross-iteration dependency**
-— see `SKILL.md`'s `do concurrent` notes. `MOM_hor_visc.F90`'s MEKE-reduction
-loops kept a serial `kk` step for exactly this reason.
+— see `references/loop-constructs.md`'s `do concurrent` notes.
+`MOM_hor_visc.F90`'s MEKE-reduction loops kept a serial `kk` step for
+exactly this reason.
 
 **A one-time initialization guarded by `if (k==1) then ... endif` inside a
 loop you're about to k-block is a race, not a safe "runs once" idiom** — see
@@ -144,9 +142,7 @@ zeroing entirely out of the k-loop into a plain sequential block that runs
 once before the block loop starts.
 
 **Guard conditions can get silently dropped when code is relocated during
-the refactor.** Moving an accumulation to sit next to a different
-conditional block is easy to get subtly wrong (dropping a guard that used to
-apply). Diff carefully against the pre-refactor logic when relocating a
+the refactor** — diff carefully against the pre-refactor logic when moving a
 conditional accumulation, not just against what compiles.
 
 ## Making the block size runtime-configurable
@@ -170,33 +166,29 @@ small literal (e.g. `1`) otherwise.
   matching:
   - The `do concurrent` header uses the **real, absolute `k`** as its index
     (`do concurrent (k=ks:ke, j=jsl:jel, i=isl:iel) ...`), not a
-    block-relative `kk`. The block-relative index is derived *inside* the
-    loop body only where it's actually needed, to index the block-sized
-    scratch array: `kk = k - ks + 1`. This reads more naturally than
-    introducing `kk` in the `do concurrent` header and computing
-    `k = kstart+kk-1` — prefer this form (`k` in the header, `kk` derived
-    inside) when the loop body's non-scratch arrays are naturally indexed by
-    the real `k` anyway.
+    block-relative `kk` — the block-relative index is derived *inside* the
+    loop body only where needed, to index the block-sized scratch array
+    (`kk = k - ks + 1`). Prefer this over introducing `kk` in the header and
+    computing `k = kstart+kk-1`, when the loop body's non-scratch arrays are
+    naturally indexed by the real `k` anyway.
   - `nkblock` is resolved once at the top of the *caller* with a plain `if`
     (`nkblock = CS%nkblock ; if (nkblock == 0) nkblock = nz`) and passed
     into the subroutine as an ordinary `intent(in)` argument — not a `merge()`
     inlined into a declaration. This is the form to follow.
-  - The block-relative scratch array (`slp`) is declared `max(1,nkblock)`-sized
-    and mapped with a single `!$omp target enter data`/`exit data` pair
-    bracketing the *whole subroutine* (outside the `do ks=1,nz,nkblock`
-    loop), not re-mapped per block.
+  - The block-relative scratch array (`slp`) is declared
+    `max(1,nkblock)`-sized and mapped with a single `!$omp target enter
+    data`/`exit data` pair bracketing the *whole subroutine* (outside the
+    `do ks=1,nz,nkblock` loop), not re-mapped per block.
   - A helper subroutine that does the final limiting (`PPM_limit_CW84`/
     `PPM_limit_pos`) is called once per k-block, taking the block's `ks`/`ke`
-    as plain integer arguments — a simple alternative to constructing a
-    `dom`-style tuple when the callee just needs a sub-range, not a
-    re-based index.
+    as plain integer arguments — simpler than constructing a `dom`-style
+    tuple when the callee just needs a sub-range, not a re-based index.
 - **`MOM_hor_visc.F90`'s `horizontal_viscosity`** (branch
   `kblock-horvisc-fromgfdl`, merge-base `b8c471cfa`): the in-progress branch
-  the gotchas above came from — useful for seeing the mistakes and their
-  fixes, not just the destination. The branch also contains several commits
-  that extract sub-blocks of the subroutine into separate helper subroutines
-  (`hor_visc_Leithy_Ah`, `hor_visc_GME_setup`, and others) — those are pure
-  code-organization moves, not part of the k-blocking technique, and aren't
-  the source of anything in this doc. Use `git log`/`git show` on the
-  k-blocking, do-concurrent-conversion, race-fix, and runtime-parameter
-  commits in that range for concrete diffs of the techniques above.
+  the gotchas above came from — useful for the mistakes and their fixes, not
+  just the destination. The branch also contains several pure
+  code-organization commits (extracting `hor_visc_Leithy_Ah`,
+  `hor_visc_GME_setup`, and others into helper subroutines) that aren't part
+  of the k-blocking technique and aren't the source of anything in this doc.
+  Use `git log`/`git show` on the k-blocking, do-concurrent-conversion,
+  race-fix, and runtime-parameter commits in that range for concrete diffs.
