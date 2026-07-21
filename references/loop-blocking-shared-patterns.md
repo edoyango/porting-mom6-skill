@@ -16,6 +16,23 @@ chunked, not per-point arithmetic or ordering) until offload directives
 appear, so a mismatch always means a real bug in that commit, not
 accumulated drift.
 
+**Extract the target routine into a submodule before starting a blocking
+pass.** The commit discipline above means many build/test cycles in a row.
+If the routine still lives directly in its parent module, editing its body
+still regenerates that module's `.mod` interface file on most builds, which
+forces every other module that `use`s it to rebuild too — on a large,
+widely-`use`d module that tax lands on every single commit in the
+sequence. Splitting the routine out into a `submodule` of its parent module
+keeps the parent's public interface (and `.mod` file) untouched by body-only
+edits, so each iteration only rebuilds the submodule and relinks. Do this
+once, as its own build/test-verified commit, before the blocking sequence
+starts — not partway through — so every commit in the bisectable sequence
+builds under the same, faster footprint. Once the blocking pass is accepted,
+fold the routine back into its parent module as its own final build/test-
+verified commit — the submodule split is a build-speed convenience for the
+duration of the blocking work, not a structural change worth keeping in the
+codebase afterward.
+
 **A block-size-1 test is necessary but not sufficient.** Once an array
 gains a block-sized dimension, every read/write site needs the
 block-relative index. A missed site still compiles and stays bit-for-bit

@@ -296,7 +296,8 @@ The `jki` and `kji` blocking recipes (`references/loop-blocking-guide.md`,
 `references/kji-loop-blocking-guide.md`) share the same commit discipline
 and hit some of the same failure modes, regardless of which dimension gets
 blocked. See `references/loop-blocking-shared-patterns.md` for that shared
-material — commit discipline, the block-size-1-insufficient gotcha, the
+material — commit discipline, extracting the target routine into a
+submodule before blocking starts, the block-size-1-insufficient gotcha, the
 `if(k==1)`-guarded-init race, the runtime-configurable-block-size pattern,
 and how to diagnose a hang during a blocking pass. Each loop-shape guide
 covers only what's specific to its own shape.
@@ -352,6 +353,7 @@ Before considering a port done:
   `horizontal_viscosity` — see `references/loop-blocking-shared-patterns.md`
   for the shared pitfalls.
 - `references/loop-blocking-shared-patterns.md` — the commit discipline,
+  extracting the target routine into a submodule before blocking starts,
   block-size-1-insufficient gotcha, `if(k==1)`-guarded-init race,
   runtime-configurable-block-size pattern, and hang-diagnosis heuristics
   shared by both loop-blocking guides above.
