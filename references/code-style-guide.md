@@ -46,6 +46,15 @@ most relevant to GPU porting work:
   unchanged. When collapsing or reassociating a loop for offload, check that
   the reassociation doesn't change floating-point order of operations for any
   sum, product, or exponentiation in the loop body.
+- **A single transcendental intrinsic call can differ between CPU and GPU**,
+  independent of any reordering above — `exp()` has been observed to not be
+  bitwise-identical between `nvfortran`'s CPU and GPU code generation for the
+  same input (found while porting `MOM_set_viscosity.F90`'s `set_viscous_ML`).
+  Same symptom as a reordered reduction (an `ocean.stats` mismatch against
+  the CPU/`dev/gpu` baseline that survives ruling out mapping and ordering
+  bugs), different cause. Workaround: precompute the value on the host
+  before entering the offloaded region rather than calling the intrinsic
+  inside the kernel.
 
 For anything not covered above (whitespace details, documentation
 conventions, etc.), check the linked wiki page directly rather than guessing.
