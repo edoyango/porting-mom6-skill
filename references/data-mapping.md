@@ -109,8 +109,8 @@ wrote, and an `update to` afterwards for every array they write that the device 
 - `post_data` and the diag mediator; `hchksum`/`uvchksum`/... (`MOM_checksums.F90`);
   `save_restart`. A newly device-resident field registered for restarts needs an `update from`
   before restarts are written.
-- `pass_var`, `pass_vector`, `start/complete_group_pass`, and `do_group_pass` without
-  `omp_offload=.true.`. With the flag, `do_group_pass` works on device data.
+- `pass_var`, `pass_vector`, and `do_group_pass` or `start/complete_group_pass` without
+  `omp_offload=.true.`. With the flag, they work on device data.
 - Unported modules, `MOM_error`, any I/O.
 - `!$OMP parallel do` is **host** code (CPU threads), easily misread as an offload directive.
 
@@ -137,9 +137,15 @@ Halo exchanges on device-resident fields:
   (`create_group_pass(CS%pass_x, field, G%Domain, halo=...)`, several fields on one handle for one
   message), and exchange them in place with `do_group_pass(CS%pass_x, G%Domain, omp_offload=.true.)`.
   The fields must stay mapped while the pass is used.
-- `pass_var` and `pass_vector` have no `omp_offload` argument, and `start_group_pass` /
-  `complete_group_pass` (the `NONBLOCKING_UPDATES` path) are host-only. Bracket them with
+- `pass_var` and `pass_vector` have no `omp_offload` argument and are host-only. Bracket them with
   `update from` before and `update to` after, or convert them to an offloaded group pass.
+- `start_group_pass` / `complete_group_pass` (the `NONBLOCKING_UPDATES` path) take
+  `omp_offload=.true.` like `do_group_pass`. Pass it to **both** calls of a pair (FMS stops with a
+  fatal error if they differ) and drop the `update from`/`update to` around them. Before dropping
+  them, check that nothing between the start and the complete reads or writes the group's fields on
+  the host, and that no device kernel writes them there (the old `update to` would have overwritten
+  that). The device copy of the message buffer is created in start and released at the end of
+  complete, so a start without its complete leaks it.
 - Size `halo=` to the stencil of the kernels that read the field (`dynamics_split_RK2` computes
   `cor_stencil`, `vel_stencil` and `cont_stencil` for this). If a ported kernel widens a stencil,
   widen the matching pass.
